@@ -3,17 +3,17 @@ import { Noise } from 'noisejs';
 const noise = new Noise(Math.random()); // Istanza di rumore Perlin
 
 // Define the chunk size (e.g., 20x20 tiles)
-const CHUNK_SIZE = 100;
+const CHUNK_SIZE = 50;
 
 // Constants
 const gridSize = 1800;
-const cellSize = 9;
+const cellSize = 4;
 const rows = gridSize / cellSize;
 const cols = gridSize / cellSize;
 
 
 // Terrain and object types
-const TERRAIN_TYPES = ['grass', 'rock', 'water'];
+const TERRAIN_TYPES = ['grass', 'rock', 'water', 'carbon'];
 const OBJECT_TYPES = ['empty', 'tree'];
 
     // Define initial zoomFactor
@@ -65,17 +65,21 @@ const waterUsage = {};
 const gridState = Array.from({ length: rows }, (_, row) =>
     Array.from({ length: cols }, (_, col) => ({
         terrain: getRandomTerrain(row, col),
-        object: getRandomObject(getRandomTerrain(row, col), row, col)
+        object: 'empty',
     }))
 );
+
+// Add carbon clusters
+addCarbonClusters(gridState);
 // Dwarfs
 const dwarfs = [];
 
 // Function to calculate which chunks need to be loaded based on the active gnome's position
+// Function to calculate active chunks around a dwarf
 function getActiveChunks(dwarf) {
     const chunkRow = Math.floor(dwarf.y / CHUNK_SIZE);
     const chunkCol = Math.floor(dwarf.x / CHUNK_SIZE);
-    const chunkRange = 2;
+    const chunkRange = 2; // Number of chunks to include around the dwarf
     const activeChunks = [];
 
     for (let row = chunkRow - chunkRange; row <= chunkRow + chunkRange; row++) {
@@ -87,6 +91,52 @@ function getActiveChunks(dwarf) {
     }
     return activeChunks;
 }
+
+function addCarbonClusters(gridState) {
+    const clusterProbability = 0.05; // 5% chance to create a cluster near each rock
+    const clusterSize = 6;
+
+    for (let row = 0; row < rows; row++) {
+        for (let col = 0; col < cols; col++) {
+            const cell = gridState[row][col];
+            if (cell.terrain === 'rock' && Math.random() < clusterProbability) {
+                createCarbonCluster(gridState, row, col, clusterSize);
+            }
+        }
+    }
+}
+
+function createCarbonCluster(gridState, startRow, startCol, clusterSize) {
+    let placed = 0;
+    const directions = [
+        [0, 1], [1, 0], [0, -1], [-1, 0], // Cardinal directions
+        [1, 1], [1, -1], [-1, 1], [-1, -1], // Diagonals
+    ];
+
+    const queue = [[startRow, startCol]];
+    while (queue.length > 0 && placed < clusterSize) {
+        const [row, col] = queue.shift();
+
+        if (
+            row >= 0 && row < rows &&
+            col >= 0 && col < cols &&
+            gridState[row][col].terrain !== 'carbon' &&
+            (gridState[row][col].terrain === 'rock' || gridState[row][col].terrain === 'grass')
+        ) {
+            gridState[row][col].terrain = 'carbon';
+            placed++;
+
+            // Randomly shuffle directions to ensure a natural spread
+            directions.sort(() => Math.random() - 0.5);
+
+            // Add neighboring cells to the queue
+            directions.forEach(([dr, dc]) => {
+                queue.push([row + dr, col + dc]);
+            });
+        }
+    }
+}
+
 
 /**
  * Generates a random terrain type for a grid cell.
@@ -153,10 +203,10 @@ function drawSpawnPoints(graphics) {
     spawnPoints.forEach((spawnPoint) => {
         graphics.beginFill(spawnPoint.color, 0.5);
         graphics.drawRect(
-            spawnPoint.x * cellSize * zoomFactor,
-            spawnPoint.y * cellSize * zoomFactor,
-            spawnPoint.width * cellSize * zoomFactor,
-            spawnPoint.height * cellSize * zoomFactor
+            spawnPoint.x * cellSize * zoomFactor,       // Apply zoom factor
+            spawnPoint.y * cellSize * zoomFactor,       // Apply zoom factor
+            spawnPoint.width * cellSize * zoomFactor,   // Apply zoom factor
+            spawnPoint.height * cellSize * zoomFactor   // Apply zoom factor
         );
         graphics.endFill();
     });
@@ -173,10 +223,10 @@ function drawDwarfs(graphics, activeChunks) {
                 dwarf.y >= chunk.row * CHUNK_SIZE && dwarf.y < (chunk.row + 1) * CHUNK_SIZE) {
                 graphics.beginFill(dwarf.color);
                 graphics.drawRect(
-                    dwarf.x * cellSize * zoomFactor + 4,
-                    dwarf.y * cellSize * zoomFactor + 4,
-                    (cellSize - 2) * zoomFactor,
-                    (cellSize - 2) * zoomFactor
+                    dwarf.x * cellSize * zoomFactor + 4, // Apply offset
+                    dwarf.y * cellSize * zoomFactor + 4, // Apply offset
+                    (cellSize - 2) * zoomFactor,        // Adjust size
+                    (cellSize - 2) * zoomFactor         // Adjust size
                 );
                 graphics.endFill();
             }
@@ -184,29 +234,54 @@ function drawDwarfs(graphics, activeChunks) {
     });
 }
 
+function resetChunk(row, col) {
+    for (let r = row * CHUNK_SIZE; r < (row + 1) * CHUNK_SIZE; r++) {
+        for (let c = col * CHUNK_SIZE; c < (col + 1) * CHUNK_SIZE; c++) {
+            gridState[r][c] = {
+                terrain: getRandomTerrain(r, c),
+                object: getRandomObject(getRandomTerrain(r, c), r, c),
+            };
+        }
+    }
+}
+
+/**
+ * Updates the dwarfs and grid state.
+ */
 /**
  * Updates the dwarfs and grid state.
  */
 function updateDwarfs() {
-    resources.activeDwarfs = 0;
-    
+    resources.activeDwarfs = 0; // Reset active dwarf count
+
+    // Define active chunks based on all active dwarfs
+    const activeChunks = dwarfs.flatMap(dwarf => getActiveChunks(dwarf));
+
+    // Filter out duplicates in activeChunks
+    const uniqueActiveChunks = [...new Set(activeChunks.map(JSON.stringify))].map(JSON.parse);
+
     // Update dwarfs and remove dead ones
     for (let i = 0; i < dwarfs.length; i++) {
         const dwarf = dwarfs[i];
-        
-        // If the dwarf is dead, remove it from the array and update active dwarfs count
+
+        // Check if the dwarf is within active chunks
+        const dwarfChunk = { row: Math.floor(dwarf.y / CHUNK_SIZE), col: Math.floor(dwarf.x / CHUNK_SIZE) };
+        const isInActiveChunk = uniqueActiveChunks.some(chunk => chunk.row === dwarfChunk.row && chunk.col === dwarfChunk.col);
+
+        // If the dwarf is outside active chunks, skip updates
+        if (!isInActiveChunk) continue;
+
+        // If the dwarf is dead, remove it from the array and update resources
         if (dwarf.state === 'dead') {
             resources.deadDwarfs++;
-            dwarfs.splice(i, 1); // Remove the dead dwarf from the array
-            i--; // Adjust the index after removing the element
-            continue; // Skip further processing for this dwarf
+            dwarfs.splice(i, 1); // Remove the dead dwarf
+            i--; // Adjust index after removal
+            continue;
         }
-        
-        // Check if dwarf is within the visible chunk before updating
-        if (dwarf.y >= startRow && dwarf.y < endRow && dwarf.x >= startCol && dwarf.x < endCol) {
-            resources.activeDwarfs++;
-            moveDwarf(dwarf); // Move dwarf within the chunk
-        }
+
+        // Update active dwarf count and handle movement
+        resources.activeDwarfs++;
+        moveDwarf(dwarf); // Move the dwarf and update its state
     }
 }
 
@@ -382,6 +457,7 @@ function drawGrid(graphics, activeChunks) {
 }
 
 
+
 /**
  * Gets the color based on terrain type.
  */
@@ -391,6 +467,7 @@ function getTerrainColor(terrain) {
         case 'rock': return 0xA9A9A9; // Gray for rock
         case 'water': return 0x1E90FF; // Blue for water
         case 'forest': return 0x228B22; // Dark green for forest
+        case 'carbon': return 0x333333; // Dark gray for carbon
         default: return 0xFFFFFF; // White as fallback
     }
 }
@@ -441,6 +518,21 @@ function updateResourceDisplay() {
     app.stage.addChild(terrainGraphics);
     app.stage.addChild(dwarfGraphics);
     
+    // Handle zoom input (mouse wheel or keys)
+window.addEventListener('keydown', (event) => {
+    if (event.key === '+') {
+        // Zoom in
+        zoomFactor = Math.min(zoomFactor + 0.1, maxZoom);
+        console.log(`Zoomed in: zoomFactor = ${zoomFactor}`);
+    } else if (event.key === '-') {
+        // Zoom out
+        zoomFactor = Math.max(zoomFactor - 0.1, minZoom);
+        console.log(`Zoomed out: zoomFactor = ${zoomFactor}`);
+    }
+    event.preventDefault(); // Prevent default browser behavior
+});
+
+
         // Handle zoom input (mouse wheel or buttons)
         window.addEventListener('wheel', (event) => {
             console.log('zoom')
