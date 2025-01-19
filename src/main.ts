@@ -1,27 +1,26 @@
-import { Application, Graphics } from 'pixi.js';
+import { Application, Graphics, Rectangle } from 'pixi.js';
 import { Noise } from 'noisejs';
 const noise = new Noise(Math.random()); // Istanza di rumore Perlin
 
 // Define the chunk size (e.g., 20x20 tiles)
-const CHUNK_SIZE = 50;
 
 // Constants
 const gridSize = 1800;
-const cellSize = 4;
+const cellSize = 10;
 const rows = gridSize / cellSize;
 const cols = gridSize / cellSize;
 
 
 // Terrain and object types
-const TERRAIN_TYPES = ['grass', 'rock', 'water', 'carbon'];
+const TERRAIN_TYPES = ['grass', 'rock', 'water'];
 const OBJECT_TYPES = ['empty', 'tree'];
 
-    // Define initial zoomFactor
-    let zoomFactor = 1; // Initial zoom factor
-    const minZoom = 0.5; // Minimum zoom level
-    const maxZoom = 10; // Maximum zoom level
+// Define initial zoomFactor
+let zoomFactor = 1; // Initial zoom factor
+const minZoom = 0.5; // Minimum zoom level
+const maxZoom = 10; // Maximum zoom level
 
-    // Initialize camera position (can be dynamically updated based on user input or scrolling)
+// Initialize camera position (can be dynamically updated based on user input or scrolling)
 let cameraX = 0;
 let cameraY = 0;
 
@@ -45,13 +44,39 @@ const spawnPoints = [
 
 ];
 
+function getPerlinNoise(row, col, scale = 0.1, octaves = 4, persistence = 0.5, lacunarity = 2.0) {
+    let amplitude = 1;
+    let frequency = scale;
+    let noiseValue = 0;
+    for (let i = 0; i < octaves; i++) {
+        noiseValue += amplitude * noise.perlin2(col * frequency, row * frequency);
+        amplitude *= persistence;
+        frequency *= lacunarity;
+    }
+    return noiseValue;
+}
+
+function transformSpawnAreaToRock(spawnPoint) {
+    const startRow = Math.max(0, spawnPoint.y - 1); // Include the row above
+    const endRow = Math.min(rows, spawnPoint.y + spawnPoint.height + 1); // Include the row below
+    const startCol = Math.max(0, spawnPoint.x - 1); // Include the column to the left
+    const endCol = Math.min(cols, spawnPoint.x + spawnPoint.width + 1); // Include the column to the right
+
+    for (let row = startRow; row < endRow; row++) {
+        for (let col = startCol; col < endCol; col++) {
+            gridState[row][col].terrain = 'rock';
+        }
+    }
+}
+
 
 let spawnTimers = Array(spawnPoints.length).fill(0); // Timers for each spawn point
 const spawnInterval = 300; // 10 seconds at 60 FPS
 
 // Resource counter and dwarf tracker
 const resources = {
-    grassConverted: 0,
+    grass: 0,
+    sand: 0,
     treesCut: 0,
     activeDwarfs: 0,
     deadDwarfs: 0
@@ -60,100 +85,170 @@ const resources = {
 // Water usage tracker
 const waterUsage = {};
 
+function isLandConnected(gridState) {
+    const visited = Array.from({ length: rows }, () => Array(cols).fill(false));
+    let landTiles = 0;
+    let connectedLand = 0;
+
+    // Find the first land tile
+    let startTile = null;
+    for (let row = 0; row < rows; row++) {
+        for (let col = 0; col < cols; col++) {
+            if (isLand(gridState[row][col].terrain)) {
+                landTiles++;
+                if (!startTile) {
+                    startTile = { row, col };
+                }
+            }
+        }
+    }
+
+    if (!startTile) return false; // No land found
+
+    // Perform flood-fill from the first land tile
+    const queue = [startTile];
+    visited[startTile.row][startTile.col] = true;
+
+    while (queue.length > 0) {
+        const { row, col } = queue.shift();
+        connectedLand++;
+
+        // Check neighbors
+        getNeighbors(row, col).forEach(neighbor => {
+            if (
+                isLand(neighbor.terrain) &&
+                !visited[neighbor.row][neighbor.col]
+            ) {
+                visited[neighbor.row][neighbor.col] = true;
+                queue.push({ row: neighbor.row, col: neighbor.col });
+            }
+        });
+    }
+
+    return connectedLand === landTiles; // Return true if all land is connected
+}
+
+function isLand(terrain) {
+    return terrain === 'grass' || terrain === 'rock' || terrain === 'forest' || terrain === 'sand';
+}
+
+// Find all disconnected land regions
+function findDisconnectedRegions(gridState, visited) {
+    const regions = [];
+    const directions = [
+        { dr: -1, dc: 0 }, { dr: 1, dc: 0 },
+        { dr: 0, dc: -1 }, { dr: 0, dc: 1 }
+    ];
+
+    for (let row = 0; row < rows; row++) {
+        for (let col = 0; col < cols; col++) {
+            if (!visited[row][col] && isLand(gridState[row][col].terrain)) {
+                const region = [];
+                const queue = [{ row, col }];
+                visited[row][col] = true;
+
+                while (queue.length > 0) {
+                    const { row: r, col: c } = queue.shift();
+                    region.push({ row: r, col: c });
+
+                    directions.forEach(({ dr, dc }) => {
+                        const nr = r + dr;
+                        const nc = c + dc;
+                        if (
+                            nr >= 0 && nr < rows &&
+                            nc >= 0 && nc < cols &&
+                            !visited[nr][nc] &&
+                            isLand(gridState[nr][nc].terrain)
+                        ) {
+                            visited[nr][nc] = true;
+                            queue.push({ row: nr, col: nc });
+                        }
+                    });
+                }
+
+                regions.push(region);
+            }
+        }
+    }
+
+    return regions;
+}
+
+// Connect a region to the main landmass
+function connectRegionToMainLand(region, gridState) {
+    const mainLand = region.length > 0 ? region[0] : null;
+    if (!mainLand) return;
+
+    const directions = [
+        { dr: -1, dc: 0 }, { dr: 1, dc: 0 },
+        { dr: 0, dc: -1 }, { dr: 0, dc: 1 }
+    ];
+
+    for (const tile of region) {
+        for (const { dr, dc } of directions) {
+            const nr = tile.row + dr;
+            const nc = tile.col + dc;
+            if (nr >= 0 && nr < rows && nc >= 0 && nc < cols) {
+                const neighbor = gridState[nr][nc];
+                if (neighbor.terrain === 'water') {
+                    neighbor.terrain = 'grass'; // Turn water into grass to connect regions
+                    return;
+                }
+            }
+        }
+    }
+}
+
+function ensureLandConnectivity(gridState) {
+    let iterations = 0; // Prevent infinite loops in edge cases
+
+    while (!isLandConnected(gridState)) {
+        console.log(`Fixing disconnected land (Iteration ${iterations + 1})...`);
+        iterations++;
+
+        if (iterations > 100) {
+            console.error("Too many iterations while fixing land connectivity.");
+            break;
+        }
+
+        // Identify isolated land regions
+        const visited = Array.from({ length: rows }, () => Array(cols).fill(false));
+        const regions = findDisconnectedRegions(gridState, visited);
+
+        // Connect isolated regions to the main landmass
+        regions.forEach(region => {
+            connectRegionToMainLand(region, gridState);
+        });
+    }
+}
 
 // Grid state
 const gridState = Array.from({ length: rows }, (_, row) =>
     Array.from({ length: cols }, (_, col) => ({
         terrain: getRandomTerrain(row, col),
-        object: 'empty',
+        object: getRandomObject(getRandomTerrain(row, col), row, col)
     }))
 );
+ensureLandConnectivity(gridState);
 
-// Add carbon clusters
-addCarbonClusters(gridState);
+spawnPoints.forEach(spawnPoint => {
+    transformSpawnAreaToRock(spawnPoint);
+});
+
 // Dwarfs
 const dwarfs = [];
-
-// Function to calculate which chunks need to be loaded based on the active gnome's position
-// Function to calculate active chunks around a dwarf
-function getActiveChunks(dwarf) {
-    const chunkRow = Math.floor(dwarf.y / CHUNK_SIZE);
-    const chunkCol = Math.floor(dwarf.x / CHUNK_SIZE);
-    const chunkRange = 2; // Number of chunks to include around the dwarf
-    const activeChunks = [];
-
-    for (let row = chunkRow - chunkRange; row <= chunkRow + chunkRange; row++) {
-        for (let col = chunkCol - chunkRange; col <= chunkCol + chunkRange; col++) {
-            if (row >= 0 && col >= 0 && row < Math.ceil(rows / CHUNK_SIZE) && col < Math.ceil(cols / CHUNK_SIZE)) {
-                activeChunks.push({ row, col });
-            }
-        }
-    }
-    return activeChunks;
-}
-
-function addCarbonClusters(gridState) {
-    const clusterProbability = 0.05; // 5% chance to create a cluster near each rock
-    const clusterSize = 6;
-
-    for (let row = 0; row < rows; row++) {
-        for (let col = 0; col < cols; col++) {
-            const cell = gridState[row][col];
-            if (cell.terrain === 'rock' && Math.random() < clusterProbability) {
-                createCarbonCluster(gridState, row, col, clusterSize);
-            }
-        }
-    }
-}
-
-function createCarbonCluster(gridState, startRow, startCol, clusterSize) {
-    let placed = 0;
-    const directions = [
-        [0, 1], [1, 0], [0, -1], [-1, 0], // Cardinal directions
-        [1, 1], [1, -1], [-1, 1], [-1, -1], // Diagonals
-    ];
-
-    const queue = [[startRow, startCol]];
-    while (queue.length > 0 && placed < clusterSize) {
-        const [row, col] = queue.shift();
-
-        if (
-            row >= 0 && row < rows &&
-            col >= 0 && col < cols &&
-            gridState[row][col].terrain !== 'carbon' &&
-            (gridState[row][col].terrain === 'rock' || gridState[row][col].terrain === 'grass')
-        ) {
-            gridState[row][col].terrain = 'carbon';
-            placed++;
-
-            // Randomly shuffle directions to ensure a natural spread
-            directions.sort(() => Math.random() - 0.5);
-
-            // Add neighboring cells to the queue
-            directions.forEach(([dr, dc]) => {
-                queue.push([row + dr, col + dc]);
-            });
-        }
-    }
-}
-
 
 /**
  * Generates a random terrain type for a grid cell.
  */
 function getRandomTerrain(row, col) {
-    const noiseScale = 0.1;
-    const noiseValue = noise.perlin2(col * noiseScale, row * noiseScale);
-    const waterThreshold = -0.2;
-    const forestThreshold = 0.2;
-    const rockThreshold = 0.5;
-
-    if (noiseValue < waterThreshold) return 'water';
-    if (noiseValue < forestThreshold) return 'forest';
-    if (noiseValue < rockThreshold) return 'rock';
-    return 'grass';
+    const noiseValue = getPerlinNoise(row, col);
+    if (noiseValue < -0.2) return 'water';
+    if (noiseValue < 0.1) return 'sand';
+    if (noiseValue < 0.4) return 'grass';
+    if (noiseValue < 0.9) return 'forest';
+    return 'rock';
 }
-
 
 /**
  * Spawns a dwarf in a specific spawn point.
@@ -203,10 +298,10 @@ function drawSpawnPoints(graphics) {
     spawnPoints.forEach((spawnPoint) => {
         graphics.beginFill(spawnPoint.color, 0.5);
         graphics.drawRect(
-            spawnPoint.x * cellSize * zoomFactor,       // Apply zoom factor
-            spawnPoint.y * cellSize * zoomFactor,       // Apply zoom factor
-            spawnPoint.width * cellSize * zoomFactor,   // Apply zoom factor
-            spawnPoint.height * cellSize * zoomFactor   // Apply zoom factor
+            spawnPoint.x * cellSize * zoomFactor,
+            spawnPoint.y * cellSize * zoomFactor,
+            spawnPoint.width * cellSize * zoomFactor,
+            spawnPoint.height * cellSize * zoomFactor
         );
         graphics.endFill();
     });
@@ -215,73 +310,42 @@ function drawSpawnPoints(graphics) {
 /**
  * Draws the dwarfs on the graphics object.
  */
-function drawDwarfs(graphics, activeChunks) {
+function drawDwarfs(graphics) {
     graphics.clear();
-    activeChunks.forEach(chunk => {
-        dwarfs.forEach(dwarf => {
-            if (dwarf.x >= chunk.col * CHUNK_SIZE && dwarf.x < (chunk.col + 1) * CHUNK_SIZE &&
-                dwarf.y >= chunk.row * CHUNK_SIZE && dwarf.y < (chunk.row + 1) * CHUNK_SIZE) {
-                graphics.beginFill(dwarf.color);
-                graphics.drawRect(
-                    dwarf.x * cellSize * zoomFactor + 4, // Apply offset
-                    dwarf.y * cellSize * zoomFactor + 4, // Apply offset
-                    (cellSize - 2) * zoomFactor,        // Adjust size
-                    (cellSize - 2) * zoomFactor         // Adjust size
-                );
-                graphics.endFill();
-            }
-        });
+    dwarfs.forEach(dwarf => {
+        graphics.beginFill(dwarf.color);
+        graphics.drawRect(
+            dwarf.x * cellSize * zoomFactor + 4,
+            dwarf.y * cellSize * zoomFactor + 4,
+            (cellSize - 2) * zoomFactor,
+            (cellSize - 2) * zoomFactor
+        );
+        graphics.endFill();
     });
 }
-
-function resetChunk(row, col) {
-    for (let r = row * CHUNK_SIZE; r < (row + 1) * CHUNK_SIZE; r++) {
-        for (let c = col * CHUNK_SIZE; c < (col + 1) * CHUNK_SIZE; c++) {
-            gridState[r][c] = {
-                terrain: getRandomTerrain(r, c),
-                object: getRandomObject(getRandomTerrain(r, c), r, c),
-            };
-        }
-    }
-}
-
-/**
- * Updates the dwarfs and grid state.
- */
 /**
  * Updates the dwarfs and grid state.
  */
 function updateDwarfs() {
-    resources.activeDwarfs = 0; // Reset active dwarf count
-
-    // Define active chunks based on all active dwarfs
-    const activeChunks = dwarfs.flatMap(dwarf => getActiveChunks(dwarf));
-
-    // Filter out duplicates in activeChunks
-    const uniqueActiveChunks = [...new Set(activeChunks.map(JSON.stringify))].map(JSON.parse);
+    resources.activeDwarfs = 0;
 
     // Update dwarfs and remove dead ones
     for (let i = 0; i < dwarfs.length; i++) {
         const dwarf = dwarfs[i];
 
-        // Check if the dwarf is within active chunks
-        const dwarfChunk = { row: Math.floor(dwarf.y / CHUNK_SIZE), col: Math.floor(dwarf.x / CHUNK_SIZE) };
-        const isInActiveChunk = uniqueActiveChunks.some(chunk => chunk.row === dwarfChunk.row && chunk.col === dwarfChunk.col);
-
-        // If the dwarf is outside active chunks, skip updates
-        if (!isInActiveChunk) continue;
-
-        // If the dwarf is dead, remove it from the array and update resources
+        // If the dwarf is dead, remove it from the array and update active dwarfs count
         if (dwarf.state === 'dead') {
             resources.deadDwarfs++;
-            dwarfs.splice(i, 1); // Remove the dead dwarf
-            i--; // Adjust index after removal
-            continue;
+            dwarfs.splice(i, 1); // Remove the dead dwarf from the array
+            i--; // Adjust the index after removing the element
+            continue; // Skip further processing for this dwarf
         }
 
-        // Update active dwarf count and handle movement
-        resources.activeDwarfs++;
-        moveDwarf(dwarf); // Move the dwarf and update its state
+        // Check if dwarf is within the visible chunk before updating
+        if (dwarf.y >= startRow && dwarf.y < endRow && dwarf.x >= startCol && dwarf.x < endCol) {
+            resources.activeDwarfs++;
+            moveDwarf(dwarf); // Move dwarf within the chunk
+        }
     }
 }
 
@@ -345,7 +409,11 @@ function moveDwarf(dwarf) {
             if (gridState[y][x].object === 'tree') {
                 resources.treesCut++;
             } else if (gridState[y][x].terrain === 'grass') {
-                resources.grassConverted++;
+                resources.grass++;
+            } else if (gridState[y][x].object === 'sand') {
+                resources.sand++;
+            } else if (gridState[y][x].terrain === 'sand') {
+                resources.sand++;
             }
 
             // Clear the grid cell
@@ -362,7 +430,7 @@ function moveDwarf(dwarf) {
     if (cuttableNeighbor) {
         dwarf.state = 'cutting';
         dwarf.cuttingProgress =
-            cuttableNeighbor.object === 'tree' ? 40 : 40; // Cutting time depends on type
+            cuttableNeighbor.object === 'tree' ? 100 : 100; // Cutting time depends on type
         dwarf.target = { x: cuttableNeighbor.col, y: cuttableNeighbor.row };
         dwarf.inactiveTurns = 0; // Reset inactivity
         return;
@@ -431,31 +499,26 @@ function getNeighbors(row, col) {
 function getCuttableNeighbor(dwarf) {
     const neighbors = getNeighbors(dwarf.y, dwarf.x);
     return neighbors.find(
-        (neighbor) => neighbor.terrain === 'grass' || neighbor.object === 'tree' 
+        (neighbor) => neighbor.terrain === 'grass' || neighbor.object === 'tree' || neighbor.terrain === 'sand'
     );
 }
-function drawGrid(graphics, activeChunks) {
+function drawGrid(graphics) {
     graphics.clear();
-    activeChunks.forEach(chunk => {
-        for (let row = chunk.row * CHUNK_SIZE; row < (chunk.row + 1) * CHUNK_SIZE; row++) {
-            for (let col = chunk.col * CHUNK_SIZE; col < (chunk.col + 1) * CHUNK_SIZE; col++) {
-                if (row < rows && col < cols) {
-                    const cell = gridState[row][col];
-                    const terrainColor = getTerrainColor(cell.terrain);
-                    graphics.beginFill(terrainColor);
-                    graphics.drawRect(
-                        col * cellSize * zoomFactor,
-                        row * cellSize * zoomFactor,
-                        cellSize * zoomFactor,
-                        cellSize * zoomFactor
-                    );
-                    graphics.endFill();
-                }
-            }
+    for (let row = 0; row < rows; row++) {
+        for (let col = 0; col < cols; col++) {
+            const cell = gridState[row][col];
+            const terrainColor = getTerrainColor(cell.terrain);
+            graphics.beginFill(terrainColor);
+            graphics.drawRect(
+                col * cellSize * zoomFactor,
+                row * cellSize * zoomFactor,
+                cellSize * zoomFactor,
+                cellSize * zoomFactor
+            );
+            graphics.endFill();
         }
-    });
+    }
 }
-
 
 
 /**
@@ -463,14 +526,14 @@ function drawGrid(graphics, activeChunks) {
  */
 function getTerrainColor(terrain) {
     switch (terrain) {
-        case 'grass': return 0x6B8E23; // Green for grass
-        case 'rock': return 0xA9A9A9; // Gray for rock
-        case 'water': return 0x1E90FF; // Blue for water
-        case 'forest': return 0x228B22; // Dark green for forest
-        case 'carbon': return 0x333333; // Dark gray for carbon
-        default: return 0xFFFFFF; // White as fallback
+        case 'grass': return 0x00AA55; // Muted green for grass
+        case 'rock': return 0x555555; // Dark gray for rocks
+        case 'water': return 0x3366FF; // Bright blue for water
+        case 'forest': return 0x007744; // Dark teal for forest
+        default: return 0xAAAAAA; // Light gray as fallback
     }
 }
+
 
 
 function getRandomObject(terrain, row, col) {
@@ -480,72 +543,118 @@ function getRandomObject(terrain, row, col) {
     return 'empty'; // Nessun oggetto su terreni non forestali
 }
 
-/**
- * Gets the color based on object type.
- */
-function getObjectColor(object) {
-    switch (object) {
-        case 'tree': return 0x228B22; // ForestGreen (green for trees)
-        case 'empty': return 0xFFFFFF; // White (no object)
-        default: return 0xFFFFFF;
-    }
-}
 
 /**
  * Updates the resource display in the control panel.
  */
 function updateResourceDisplay() {
-    const resourcesDiv = document.getElementById('resources');
-    resourcesDiv.innerHTML = `
+    const resourceCountersDiv = document.getElementById('resource-counters');
+    if (!resourceCountersDiv) {
+        console.error('Element with id "resource-counters" not found in the DOM');
+        return;
+    }
+    resourceCountersDiv.innerHTML = `
         <strong>Active Dwarfs:</strong> ${resources.activeDwarfs}<br>
         <strong>Dead Dwarfs:</strong> ${resources.deadDwarfs}<br>
-        <strong>Grass Converted:</strong> ${resources.grassConverted}<br>
-        <strong>Trees Cut:</strong> ${resources.treesCut}<br>
+        <strong>Grass:</strong> ${resources.grass}<br>
+        <strong>Sand:</strong> ${resources.sand}<br>
+        <strong>Wood:</strong> ${resources.treesCut}<br>
     `;
 }
 
 /**
  * Main game loop setup.
  */
+let isPaused = false; // Tracks whether the game is paused
+
 (async () => {
     const app = new Application();
 
-    await app.init({ antialias: true, resizeTo: window });
+    await app.init({
+        resolution: 1, // Ensure scaling matches pixel ratio
+        antialias: false, // Disable anti-aliasing for sharp pixel edges
+        autoDensity: true, resizeTo: window
+    });
     document.body.appendChild(app.canvas);
 
     const terrainGraphics = new Graphics();
+    terrainGraphics.interactive = true;
+
     const dwarfGraphics = new Graphics();
+    dwarfGraphics.interactive = true;
     app.stage.addChild(terrainGraphics);
     app.stage.addChild(dwarfGraphics);
-    
-    // Handle zoom input (mouse wheel or keys)
-window.addEventListener('keydown', (event) => {
-    if (event.key === '+') {
-        // Zoom in
-        zoomFactor = Math.min(zoomFactor + 0.1, maxZoom);
-        console.log(`Zoomed in: zoomFactor = ${zoomFactor}`);
-    } else if (event.key === '-') {
-        // Zoom out
-        zoomFactor = Math.max(zoomFactor - 0.1, minZoom);
-        console.log(`Zoomed out: zoomFactor = ${zoomFactor}`);
-    }
-    event.preventDefault(); // Prevent default browser behavior
-});
 
+    // Handle grid interactions
+    terrainGraphics.on('pointerdown', (event) => {
+        const mouseX = event.globalX;
+        const mouseY = event.globalY;
+        const col = Math.floor(mouseX / (cellSize * zoomFactor));
+        const row = Math.floor(mouseY / (cellSize * zoomFactor));
 
-        // Handle zoom input (mouse wheel or buttons)
-        window.addEventListener('wheel', (event) => {
-            console.log('zoom')
-            if (event.deltaY < 0) {
-                // Zoom in
-                zoomFactor = Math.min(zoomFactor + 0.1, maxZoom);
-            } else {
-                // Zoom out
-                zoomFactor = Math.max(zoomFactor - 0.1, minZoom);
+        if (row >= 0 && row < rows && col >= 0 && col < cols) {
+            const tile = gridState[row][col];
+            const description = `
+                <strong>Selected Tile:</strong><br>
+                <strong>Terrain:</strong> ${tile.terrain}<br>
+                <strong>Object:</strong> ${tile.object}
+            `;
+            const tileInfoDiv = document.getElementById('tile-info');
+            if (!tileInfoDiv) {
+                console.error('Element with id "tile-info" not found in the DOM');
+                return;
             }
-            event.preventDefault(); // Prevent page scroll
-        });
+            tileInfoDiv.innerHTML = description;
+        }
+    });
+    dwarfGraphics.on('pointerdown', (event) => {
+        const mouseX = event.globalX;
+        const mouseY = event.globalY;
+        const col = Math.floor(mouseX / (cellSize * zoomFactor));
+        const row = Math.floor(mouseY / (cellSize * zoomFactor));
 
+        if (row >= 0 && row < rows && col >= 0 && col < cols) {
+            const tile = gridState[row][col];
+            const dwarf = dwarfs.find(d => d.x === col && d.y === row); // Check if a dwarf exists at this location
+
+            let description = `
+                <strong>Selected Tile:</strong><br>
+                <strong>Terrain:</strong> ${tile.terrain}<br>
+                <strong>Object:</strong> ${tile.object}<br>
+            `;
+
+            if (dwarf) {
+                description += `
+                    <strong>Dwarf Info:</strong><br>
+                    <strong>State:</strong> ${dwarf.state}<br>
+                    <strong>Thirst:</strong> ${dwarf.thirst}<br>
+                    <strong>Cutting Progress:</strong> ${dwarf.cuttingProgress}<br>
+                `;
+            } else {
+                description += `<strong>No dwarf at this location.</strong>`;
+            }
+
+            const tileInfoDiv = document.getElementById('tile-info');
+            if (!tileInfoDiv) {
+                console.error('Element with id "tile-info" not found in the DOM');
+                return;
+            }
+            tileInfoDiv.innerHTML = description;
+        }
+    });
+
+
+    // Handle zoom input
+    window.addEventListener('wheel', (event) => {
+        if (event.deltaY < 0) {
+            zoomFactor = Math.min(zoomFactor + 0.1, maxZoom);
+        } else {
+            zoomFactor = Math.max(zoomFactor - 0.1, minZoom);
+        }
+        event.preventDefault(); // Prevent page scroll
+    });
+
+    // Create a control panel
     const controlPanel = document.createElement('div');
     controlPanel.style.position = 'absolute';
     controlPanel.style.top = '10px';
@@ -558,24 +667,65 @@ window.addEventListener('keydown', (event) => {
     controlPanel.style.fontSize = '14px';
     controlPanel.innerHTML = `
         <h3>Game Info</h3>
-        <div id="resources"></div>
+        <div id="resource-counters"></div>
+        <div id="tile-info" style="margin-top: 10px;"></div>
+        <button id="pause-button" style="margin-top: 10px; padding: 5px;">Pause</button>
+        <button id="resume-button" style="margin-top: 5px; padding: 5px;">Resume</button>
     `;
     document.body.appendChild(controlPanel);
+    // Button handlers
+    const pauseButton = document.getElementById('pause-button');
+    const resumeButton = document.getElementById('resume-button');
 
-    spawnDwarfInSpawnPoint(spawnPoints[0]); // Adjust index for the desired spawn point
-    spawnDwarfInSpawnPoint(spawnPoints[1]); // Adjust index for the desired spawn point
-    app.ticker.speed = 0.1;
+    document.getElementById('pause-button').addEventListener('click', () => {
+        isPaused = true;
+        pauseButton.style.display = 'none'; // Hide Pause button
+        resumeButton.style.display = 'inline'; // Show Resume button
+        console.log('Game Paused');
+    });
+
+    document.getElementById('resume-button').addEventListener('click', () => {
+        isPaused = false;
+        resumeButton.style.display = 'none'; // Hide Resume button
+        pauseButton.style.display = 'inline'; // Show Pause button
+        console.log('Game Resumed');
+    });
+    terrainGraphics.on('pointermove', (event) => {
+        const mouseX = event.globalX;
+        const mouseY = event.globalY;
+        const col = Math.floor(mouseX / (cellSize * zoomFactor)) + startCol;
+        const row = Math.floor(mouseY / (cellSize * zoomFactor)) + startRow;
+        if (row >= 0 && row < rows && col >= 0 && col < cols) {
+            const tile = gridState[row][col];
+            console.log(`Hovered on tile: ${tile.terrain}`);
+        }
+    });
+
+    // Initial state: Show only Pause button
+    pauseButton.style.display = 'inline';
+    resumeButton.style.display = 'none';
+    // Spawn initial dwarfs
+    spawnDwarfInSpawnPoint(spawnPoints[0]);
+    spawnDwarfInSpawnPoint(spawnPoints[1]);
+    window.addEventListener('keydown', (event) => {
+        const moveStep = 10;
+        if (event.key === 'ArrowUp') cameraY = Math.max(cameraY - moveStep, 0);
+        if (event.key === 'ArrowDown') cameraY = Math.min(cameraY + moveStep, gridSize - viewportHeight);
+        if (event.key === 'ArrowLeft') cameraX = Math.max(cameraX - moveStep, 0);
+        if (event.key === 'ArrowRight') cameraX = Math.min(cameraX + moveStep, gridSize - viewportWidth);
+    });
+    app.ticker.speed = 0.001;
+
+    // Game loop
     app.ticker.add(() => {
-        app.ticker.speed = 0.1;
+        if (isPaused) return; // Skip updates when paused
+
         updateSpawnPoints(); // Update all spawn points
         updateDwarfs(); // Update dwarf logic
-    
-        // Get active chunks based on the position of the active gnome
-        const activeChunks = getActiveChunks(dwarfs[0]); // Assuming we use the first gnome for this example
-    
-        drawGrid(terrainGraphics, activeChunks); // Draw active chunks of the grid
+
+        drawGrid(terrainGraphics); // Draw the entire grid
         drawSpawnPoints(terrainGraphics); // Draw all spawn points
-        drawDwarfs(dwarfGraphics, activeChunks); // Draw dwarfs in active chunks
+        drawDwarfs(dwarfGraphics); // Draw all dwarfs on the grid
         updateResourceDisplay(); // Update resource counters
     });
 })();
