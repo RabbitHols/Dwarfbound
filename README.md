@@ -1,1 +1,1 @@
-Spaghetti codo are being served.
+Spaghetti code are being served.
